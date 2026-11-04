@@ -32,7 +32,7 @@ flowchart TD
     A([BẮT ĐẦU<br>Cấp nguồn]) --> B[Khởi tạo ESP32<br>Tắt quạt, thanh nhiệt và UV]
     B --> C[/Đọc cảm biến/]
     C --> D{Các cảm biến<br>bắt buộc hợp lệ?}
-    D -- Không --> F[[LỖI<br>Tắt gia nhiệt và UV<br>Ghi nhận lỗi, chờ kiểm tra]]
+    D -- Không --> F[[LỖI<br>Tắt thanh nhiệt và UV<br>Quạt chỉ chạy nếu an toàn]]
     D -- Có --> E{Có khăn<br>trên giá?}
     E -- Không --> G([CHỜ<br>Mọi ngõ ra tắt])
     G --> C
@@ -42,11 +42,16 @@ flowchart TD
     J -- Không --> F
     J -- Có --> K[Chuyển sang trạng thái sấy]
     K --> L[Giữ cả hai quạt chạy]
-    L --> M{Khăn vẫn<br>đang treo?}
-    M -- Không --> N[Tắt thanh nhiệt<br>Chạy quạt làm nguội trong thời gian ngắn]
-    N --> X([Tắt quạt<br>Quay lại chờ])
+    L --> M[/Đọc lại cảm biến<br>theo chu kỳ/]
+    M --> M1{Cảm biến hợp lệ<br>và dữ liệu còn mới?}
+    M1 -- Không --> F
+    M1 -- Có --> M2{Khăn vẫn treo<br>sau khi lọc nhiễu?}
+    M2 -- Không --> N{Cảm biến nhiệt hợp lệ<br>và dưới giới hạn làm nguội?}
+    N -- Có --> N1[Tắt thanh nhiệt<br>Chạy quạt làm nguội trong thời gian ngắn]
+    N1 --> X([Tắt mọi ngõ ra<br>Quay lại chờ])
+    N -- Không --> X
     X --> C
-    M -- Có --> O{Nhiệt độ từ<br>55°C trở lên?}
+    M2 -- Có --> O{Nhiệt độ từ<br>55°C trở lên?}
     O -- Có --> F
     O -- Không --> P{Nhiệt độ gió ra<br>dưới 40°C?}
     P -- Có --> Q[Bật thanh nhiệt<br>Cầu chì nhiệt vẫn bảo vệ độc lập]
@@ -56,10 +61,13 @@ flowchart TD
     Q --> U[/Cập nhật nhiệt độ<br>và số đo độ ẩm/]
     S --> U
     T --> U
-    U --> V{Điều kiện khăn khô<br>đã hiệu chỉnh được duy trì đủ lâu?}
+    U --> U1{Đã đạt thời gian chạy tối đa?}
+    U1 -- Có --> W1[Tắt thanh nhiệt<br>Chạy quạt làm nguội và báo kiểm tra khăn]
+    U1 -- Chưa --> V{Điều kiện khăn khô<br>đã hiệu chỉnh được duy trì đủ lâu?}
     V -- Chưa --> L
-    V -- Rồi --> W[Tắt thanh nhiệt<br>Giữ quạt chạy để làm nguội]
-    W --> X
+    V -- Rồi --> W2[Tắt thanh nhiệt<br>Giữ quạt chạy để làm nguội]
+    W1 --> X
+    W2 --> X
     F --> Y{Người phụ trách<br>đã kiểm tra và reset?}
     Y -- Chưa --> F
     Y -- Rồi --> B
@@ -72,23 +80,23 @@ flowchart TD
     classDef fault fill:#F9DEDE,color:#7A1F1F,stroke:#C0392B,stroke-width:2.5px;
 
     class A,G,X startEnd;
-    class B,H,K,L,N,Q,S,T,W process;
-    class C,I,U sensor;
-    class D,E,J,M,O,P,R,V,Y decision;
+    class B,H,K,L,N1,Q,S,T,W1,W2 process;
+    class C,I,U,M sensor;
+    class D,E,J,M1,M2,N,O,P,R,U1,V,Y decision;
     class F fault;
 
     linkStyle 3 stroke:#C0392B,stroke-width:2.5px;
     linkStyle 10 stroke:#C0392B,stroke-width:2.5px;
-    linkStyle 18 stroke:#C0392B,stroke-width:2.5px;
-    linkStyle 32 stroke:#C0392B,stroke-width:2.5px;
+    linkStyle 15 stroke:#C0392B,stroke-width:2.5px;
+    linkStyle 23 stroke:#C0392B,stroke-width:2.5px;
+    linkStyle 40 stroke:#C0392B,stroke-width:2.5px;
     linkStyle 4 stroke:#248A5B,stroke-width:2.5px;
     linkStyle 7 stroke:#248A5B,stroke-width:2.5px;
     linkStyle 11 stroke:#248A5B,stroke-width:2.5px;
-    linkStyle 17 stroke:#248A5B,stroke-width:2.5px;
-    linkStyle 20 stroke:#248A5B,stroke-width:2.5px;
+    linkStyle 16 stroke:#248A5B,stroke-width:2.5px;
     linkStyle 22 stroke:#248A5B,stroke-width:2.5px;
-    linkStyle 29 stroke:#248A5B,stroke-width:2.5px;
-    linkStyle 33 stroke:#248A5B,stroke-width:2.5px;
+    linkStyle 25 stroke:#248A5B,stroke-width:2.5px;
+    linkStyle 41 stroke:#248A5B,stroke-width:2.5px;
     class Q,S heater;
 ```
 
@@ -100,6 +108,7 @@ flowchart TD
 - Chỉ cho phép bật thanh nhiệt khi DS18B20, SHT31 và AHT20 đều trả về số đo hợp lệ.
 - Xem dữ liệu mất kết nối, ngoài dải cho phép hoặc không cập nhật là lỗi. Số đo nhiệt độ không hợp lệ không được xem là điều kiện cho phép gia nhiệt.
 - TCRT5000 chỉ dùng để xác định có khăn hay không. Không dùng cảm biến này làm liên động an toàn cho đèn UV-C.
+- Lọc nhiễu tín hiệu TCRT5000 bằng cách yêu cầu trạng thái có khăn hoặc không có khăn duy trì ổn định trong một khoảng ngắn trước khi đổi trạng thái. Chọn khoảng thời gian sau khi thử cảm biến trên khung thật.
 
 ### Liên động quạt và thanh nhiệt
 
@@ -131,6 +140,8 @@ Trước khi hiệu chỉnh xong, chưa nên khẳng định chức năng tự n
 ### Dừng và xử lý lỗi
 
 - Nếu khăn bị lấy ra, tắt thanh nhiệt ngay. Chỉ giữ quạt chạy làm nguội trong thời gian ngắn nếu cảm biến nhiệt hợp lệ và nhiệt độ dưới ngưỡng lỗi; sau đó tắt quạt.
+- Kiểm tra tính hợp lệ và độ mới của dữ liệu cảm biến ở mỗi vòng lặp điều khiển, không chỉ lúc khởi động. Nếu cảm biến cần thiết mất kết nối hoặc ngừng cập nhật, tắt thanh nhiệt và chốt lỗi.
+- Khi hết thời gian chạy tối đa đã hiệu chỉnh, tắt thanh nhiệt, làm nguội bằng quạt nếu điều kiện nhiệt độ an toàn, rồi báo người vận hành kiểm tra khăn. Thời gian tối đa là ngưỡng dự phòng, không phải bằng chứng khăn đã khô.
 - Khi có bất kỳ lỗi nào, tắt thanh nhiệt và UV ngay. Giữ lỗi cho đến khi người vận hành kiểm tra và reset.
 - Đèn UV-C chưa nằm trong lưu đồ điều khiển này. Không cấp điện cho dải LED đang có nếu chưa xác minh bước sóng và tính phù hợp với UV-C. Thiết kế UV-C sau này cần che chắn độc lập và liên động để không làm lộ tia khi khăn bị lấy ra hoặc cảm biến gặp lỗi.
 
@@ -145,6 +156,7 @@ Trước khi hiệu chỉnh xong, chưa nên khẳng định chức năng tự n
 | Thời gian xác nhận khăn khô | Chọn dựa trên dữ liệu thử nghiệm | Chưa chốt |
 | Thời gian chạy quạt làm nguội | Chọn theo thời gian nguội đo được | Chưa chốt |
 | Thời gian chạy tối đa | Chọn sau các lần thử có giám sát | Chưa chốt |
+| Chu kỳ đọc cảm biến và thời gian lọc nhiễu TCRT5000 | Chọn theo tốc độ phản hồi cần thiết và thử nghiệm trên mô hình | Chưa chốt |
 
 ## Trình tự thử nghiệm cho phần điều khiển
 
