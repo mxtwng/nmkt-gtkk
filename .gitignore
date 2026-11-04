@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ESP-IDF
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# PlatformIO
+.pio/
+.platformio/
+
+# Arduino IDE
+*.ino.eide
+*.elf
+*.hex
+*.bin
+*.map
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+secrets.*
+
+# Office temporary files
+~$*.docx
+~$*.xlsx
+~$*.pptx
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
