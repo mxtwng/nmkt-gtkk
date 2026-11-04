@@ -42,10 +42,13 @@ CHO
 KIEM_TRA_GIO
 DANG_SAY
 LAM_NGUOI
+CHO_LAY_KHAN_RA
 LOI
 ```
 
 Trạng thái `LAM_NGUOI` có thể dùng chung cho các trường hợp tháo khăn, sấy xong hoặc hết thời gian chạy tối đa. Sau khi hết thời gian làm nguội an toàn, máy tắt quạt và quay về `CHO`.
+
+Nếu chu kỳ sấy kết thúc nhưng khăn vẫn còn trên giá, dùng `CHO_LAY_KHAN_RA` để tránh tự khởi động lại liên tục. Chỉ quay về `CHO` sau khi xác nhận khăn đã được lấy ra.
 
 ## Giả mã vòng lặp điều khiển
 
