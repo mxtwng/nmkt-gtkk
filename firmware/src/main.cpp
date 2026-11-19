@@ -1,361 +1,148 @@
+// Towel dryer - ESP32 NodeMCU (38 pin)
+// Libs: Adafruit SHT31 Library, Adafruit AHTX0, OneWire, DallasTemperature
+//
+// Pins
+//   GPIO25 -> MOSFET trig (both fans, in parallel)
+//   GPIO26 -> MOSFET trig (PTC 1)
+//   GPIO27 -> MOSFET trig (PTC 2)  (mirrors PTC 1; leave unconnected if one MOSFET drives both)
+//   GPIO4  -> DS18B20 data (4.7k pull-up to 3V3)
+//   GPIO21 -> SDA (SHT31 + AHT20)
+//   GPIO22 -> SCL (SHT31 + AHT20)
+//   GPIO34 -> TCRT5000 DO (input only pin)
+
 #include <Arduino.h>
-#include <stdlib.h>
-#include <string.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_SHT31.h>
+#include <Adafruit_AHTX0.h>
 
-namespace {
-// Mo phong phan mem: cac ngõ ra chi la bien trong bo nho, khong noi GPIO.
-constexpr unsigned long kLoopIntervalMs = 100;
-constexpr unsigned long kStatusIntervalMs = 1000;
-constexpr unsigned long kTowelDebounceMs = 500;
-constexpr unsigned long kAirflowSettleMs = 3000;
-constexpr unsigned long kDryConfirmMs = 15000;
-constexpr unsigned long kCooldownMs = 5000;
-constexpr unsigned long kSimulationMaxRunMs = 120000;
-constexpr float kHeaterOnC = 40.0f;
-constexpr float kHeaterOffC = 45.0f;
-constexpr float kOverheatC = 55.0f;
-constexpr size_t kCommandBufferSize = 80;
+#define PIN_FAN      25
+#define PIN_PTC1     26
+#define PIN_PTC2     27
+#define PIN_ONEWIRE   4
+#define PIN_TOWEL    34
 
-enum class State {
-  IDLE,
-  AIRFLOW_CHECK,
-  DRYING,
-  COOLING,
-  WAIT_FOR_REMOVAL,
-  FAULT,
-};
+// TCRT5000 module: DO usually goes LOW when something is in front of it.
+// If towel detection is inverted, flip this.
+#define TOWEL_ACTIVE_LOW true
 
-struct Inputs {
-  bool sensorsValid = true;  // Gia lap mac dinh de co the thu bang Serial.
-  bool towelRequested = false;
-  bool towelPresent = false;
-  bool dryCondition = false;
-  float outletTemperatureC = 25.0f;
-};
+// --- Tunables ---
+const float    T_HEAT_ON   = 40.0;   // PTC turns on below this (air out, C)
+const float    T_HEAT_OFF  = 45.0;   // PTC turns off above this
+const float    T_HARD_CUT  = 55.0;   // emergency cut
+const float    DRY_MARGIN  = 5.0;    // towel dry when inside RH <= room RH + this
+const uint32_t DRY_HOLD_MS = 5UL * 60UL * 1000UL;   // must stay dry this long
+const uint32_t MIN_RUN_MS  = 2UL * 60UL * 1000UL;   // ignore dry check at start
+const uint32_t MAX_RUN_MS  = 4UL * 3600UL * 1000UL; // hard timeout
+const uint32_t COOL_MS     = 2UL * 60UL * 1000UL;   // fan-only cooldown
+const uint8_t  TOWEL_DEBOUNCE = 3;                   // seconds
 
-struct VirtualOutputs {
-  bool fansOn = false;
-  bool heatersOn = false;
-  bool uvOn = false;
-};
+OneWire oneWire(PIN_ONEWIRE);
+DallasTemperature ds(&oneWire);
+Adafruit_SHT31 sht;
+Adafruit_AHTX0 aht;
 
-Inputs inputs;
-VirtualOutputs outputs;
-State state = State::IDLE;
-unsigned long lastLoopMs = 0;
-unsigned long lastStatusMs = 0;
-unsigned long towelChangeMs = 0;
-unsigned long stateStartedMs = 0;
-unsigned long dryConditionStartedMs = 0;
-bool dryTimerRunning = false;
-char faultReason[48] = "";
-char commandBuffer[kCommandBufferSize];
-size_t commandLength = 0;
+enum State { IDLE, RUN, COOL, DONE };
+State state = IDLE;
 
-const char* stateName(State value) {
-  switch (value) {
-    case State::IDLE: return "CHO";
-    case State::AIRFLOW_CHECK: return "KIEM_TRA_GIO";
-    case State::DRYING: return "DANG_SAY";
-    case State::COOLING: return "LAM_NGUOI";
-    case State::WAIT_FOR_REMOVAL: return "CHO_LAY_KHAN_RA";
-    case State::FAULT: return "LOI";
-  }
-  return "KHONG_RO";
+bool shtOk = false, ahtOk = false;
+bool ptcOn = false;
+uint32_t stateStart = 0, dryStart = 0, lastTick = 0;
+uint8_t towelCount = 0;
+bool towelPresent = false;
+
+void setPTC(bool on) {
+  ptcOn = on;
+  digitalWrite(PIN_PTC1, on);
+  digitalWrite(PIN_PTC2, on);
 }
+void setFan(bool on) { digitalWrite(PIN_FAN, on); }
 
-void enterState(State next, unsigned long now) {
-  if (state == next) return;
-  state = next;
-  stateStartedMs = now;
-  Serial.print("Chuyen trang thai: ");
-  Serial.println(stateName(state));
+void enter(State s) {
+  state = s;
+  stateStart = millis();
+  dryStart = 0;
+  Serial.printf("STATE -> %d\n", s);
 }
-
-void latchFault(const char* reason, unsigned long now) {
-  outputs.heatersOn = false;
-  outputs.uvOn = false;
-  outputs.fansOn = false;
-  strncpy(faultReason, reason, sizeof(faultReason) - 1);
-  faultReason[sizeof(faultReason) - 1] = '\0';
-  enterState(State::FAULT, now);
-}
-
-void printHelp() {
-  Serial.println("Lenh mo phong (khong dieu khien GPIO):");
-  Serial.println("  help             - hien lenh");
-  Serial.println("  status           - in trang thai va gia tri mo phong");
-  Serial.println("  sensors ok|fail  - mo phong cam bien tot/loi");
-  Serial.println("  towel on|off     - mo phong treo/lay khan");
-  Serial.println("  temp <do_C>      - dat nhiet do gio ra mo phong");
-  Serial.println("  dry on|off       - mo phong dieu kien kho da hieu chinh");
-  Serial.println("  reset            - xoa loi mo phong");
-}
-
-void printStatus(unsigned long now) {
-  Serial.print("Trang thai=");
-  Serial.print(stateName(state));
-  Serial.print(" | cam_bien=");
-  Serial.print(inputs.sensorsValid ? "OK" : "LOI");
-  Serial.print(" | khan=");
-  Serial.print(inputs.towelPresent ? "CO" : "KHONG");
-  Serial.print(" | nhiet_do=");
-  Serial.print(inputs.outletTemperatureC, 1);
-  Serial.print(" C | dieu_kien_kho=");
-  Serial.print(inputs.dryCondition ? "CO" : "KHONG");
-  Serial.print(" | quat_ao=");
-  Serial.print(outputs.fansOn ? "BAT" : "TAT");
-  Serial.print(" | gia_nhiet_ao=");
-  Serial.print(outputs.heatersOn ? "BAT" : "TAT");
-  if (state == State::FAULT) {
-    Serial.print(" | loi=");
-    Serial.print(faultReason);
-  }
-  if (state == State::DRYING) {
-    Serial.print(" | giay_mo_phong=");
-    Serial.print((now - stateStartedMs) / 1000);
-  }
-  Serial.println();
-}
-
-void processCommand(char* line, unsigned long now) {
-  char* command = strtok(line, " \t\r\n");
-  if (command == nullptr) return;
-
-  if (strcmp(command, "help") == 0) {
-    printHelp();
-  } else if (strcmp(command, "status") == 0) {
-    printStatus(now);
-  } else if (strcmp(command, "sensors") == 0) {
-    char* value = strtok(nullptr, " \t\r\n");
-    if (value == nullptr) {
-      Serial.println("Thieu gia tri: sensors ok|fail");
-    } else if (strcmp(value, "ok") == 0) {
-      inputs.sensorsValid = true;
-      Serial.println("Da mo phong: cam bien hop le.");
-    } else if (strcmp(value, "fail") == 0) {
-      inputs.sensorsValid = false;
-      Serial.println("Da mo phong: cam bien loi.");
-    } else {
-      Serial.println("Gia tri khong hop le. Dung: sensors ok|fail");
-    }
-  } else if (strcmp(command, "towel") == 0) {
-    char* value = strtok(nullptr, " \t\r\n");
-    if (value == nullptr) {
-      Serial.println("Thieu gia tri: towel on|off");
-    } else if (strcmp(value, "on") == 0) {
-      inputs.towelRequested = true;
-      towelChangeMs = now;
-      Serial.println("Da nhan lenh mo phong: treo khan.");
-    } else if (strcmp(value, "off") == 0) {
-      inputs.towelRequested = false;
-      towelChangeMs = now;
-      Serial.println("Da nhan lenh mo phong: lay khan ra.");
-    } else {
-      Serial.println("Gia tri khong hop le. Dung: towel on|off");
-    }
-  } else if (strcmp(command, "temp") == 0) {
-    char* value = strtok(nullptr, " \t\r\n");
-    if (value == nullptr) {
-      Serial.println("Thieu gia tri. Vi du: temp 42");
-    } else {
-      char* end = nullptr;
-      const float parsed = strtof(value, &end);
-      if (end == value || *end != '\0' || parsed < -40.0f || parsed > 150.0f) {
-        Serial.println("Nhiet do khong hop le (-40 den 150 C).");
-      } else {
-        inputs.outletTemperatureC = parsed;
-        Serial.println("Da cap nhat nhiet do mo phong.");
-      }
-    }
-  } else if (strcmp(command, "dry") == 0) {
-    char* value = strtok(nullptr, " \t\r\n");
-    if (value == nullptr) {
-      Serial.println("Thieu gia tri: dry on|off");
-    } else if (strcmp(value, "on") == 0) {
-      inputs.dryCondition = true;
-      Serial.println("Da mo phong: dieu kien kho dat.");
-    } else if (strcmp(value, "off") == 0) {
-      inputs.dryCondition = false;
-      dryTimerRunning = false;
-      Serial.println("Da mo phong: dieu kien kho chua dat.");
-    } else {
-      Serial.println("Gia tri khong hop le. Dung: dry on|off");
-    }
-  } else if (strcmp(command, "reset") == 0) {
-    if (state != State::FAULT) {
-      Serial.println("May khong o trang thai loi.");
-    } else if (!inputs.sensorsValid) {
-      Serial.println("Chua reset: cam bien mo phong van dang loi.");
-    } else {
-      faultReason[0] = '\0';
-      dryTimerRunning = false;
-      outputs = {};
-      enterState(State::IDLE, now);
-      Serial.println("Da reset loi mo phong.");
-    }
-  } else {
-    Serial.println("Khong nhan ra lenh. Nhap help de xem lenh.");
-  }
-}
-
-void readSerialCommands(unsigned long now) {
-  while (Serial.available() > 0) {
-    const char ch = static_cast<char>(Serial.read());
-    if (ch == '\n' || ch == '\r') {
-      if (commandLength > 0) {
-        commandBuffer[commandLength] = '\0';
-        processCommand(commandBuffer, now);
-        commandLength = 0;
-      }
-    } else if (commandLength < kCommandBufferSize - 1) {
-      commandBuffer[commandLength++] = ch;
-    } else {
-      commandLength = 0;
-      Serial.println("Lenh qua dai, da bo qua.");
-    }
-  }
-}
-
-void updateTowelDebounce(unsigned long now) {
-  if (inputs.towelRequested != inputs.towelPresent &&
-      now - towelChangeMs >= kTowelDebounceMs) {
-    inputs.towelPresent = inputs.towelRequested;
-    Serial.print("Trang thai khan da loc nhieu: ");
-    Serial.println(inputs.towelPresent ? "CO KHAN" : "KHONG CO KHAN");
-  }
-}
-
-void updateController(unsigned long now) {
-  updateTowelDebounce(now);
-
-  if (state == State::FAULT) {
-    outputs.heatersOn = false;
-    outputs.uvOn = false;
-    outputs.fansOn = false;
-    return;
-  }
-
-  if (!inputs.sensorsValid) {
-    latchFault("Cam bien mo phong khong hop le", now);
-    return;
-  }
-
-  switch (state) {
-    case State::IDLE:
-      outputs = {};
-      if (inputs.towelPresent) {
-        outputs.fansOn = true;
-        enterState(State::AIRFLOW_CHECK, now);
-      }
-      break;
-
-    case State::AIRFLOW_CHECK:
-      outputs.fansOn = true;
-      outputs.heatersOn = false;
-      if (!inputs.towelPresent) {
-        outputs.fansOn = false;
-        enterState(State::IDLE, now);
-      } else if (inputs.outletTemperatureC >= kOverheatC) {
-        latchFault("Qua nhiet khi kiem tra gio", now);
-      } else if (now - stateStartedMs >= kAirflowSettleMs) {
-        enterState(State::DRYING, now);
-      }
-      break;
-
-    case State::DRYING:
-      outputs.fansOn = true;
-      if (inputs.outletTemperatureC >= kOverheatC) {
-        latchFault("Qua nhiet", now);
-        break;
-      }
-      if (!inputs.towelPresent) {
-        outputs.heatersOn = false;
-        dryTimerRunning = false;
-        enterState(State::COOLING, now);
-        break;
-      }
-      if (inputs.outletTemperatureC < kHeaterOnC) {
-        outputs.heatersOn = true;
-      } else if (inputs.outletTemperatureC >= kHeaterOffC) {
-        outputs.heatersOn = false;
-      }
-
-      if (inputs.dryCondition) {
-        if (!dryTimerRunning) {
-          dryTimerRunning = true;
-          dryConditionStartedMs = now;
-        } else if (now - dryConditionStartedMs >= kDryConfirmMs) {
-          outputs.heatersOn = false;
-          dryTimerRunning = false;
-          enterState(State::COOLING, now);
-          break;
-        }
-      } else {
-        dryTimerRunning = false;
-      }
-
-      if (now - stateStartedMs >= kSimulationMaxRunMs) {
-        outputs.heatersOn = false;
-        dryTimerRunning = false;
-        Serial.println("Da het gioi han mo phong; can kiem tra khan.");
-        enterState(State::COOLING, now);
-      }
-      break;
-
-    case State::COOLING:
-      outputs.heatersOn = false;
-      outputs.fansOn = inputs.sensorsValid && inputs.outletTemperatureC < kOverheatC;
-      if (!outputs.fansOn || now - stateStartedMs >= kCooldownMs) {
-        outputs.fansOn = false;
-        if (inputs.towelPresent) {
-          enterState(State::WAIT_FOR_REMOVAL, now);
-        } else {
-          enterState(State::IDLE, now);
-        }
-      }
-      break;
-
-    case State::WAIT_FOR_REMOVAL:
-      outputs = {};
-      if (!inputs.towelPresent) {
-        enterState(State::IDLE, now);
-      }
-      break;
-
-    case State::FAULT:
-      break;
-  }
-}
-}  // namespace
 
 void setup() {
   Serial.begin(115200);
-  lastLoopMs = millis();
-  lastStatusMs = lastLoopMs;
-  Serial.println();
-  Serial.println("MO PHONG DIEU KHIEN MAY SAY KHAN");
-  Serial.println("Chi mo phong logic; khong co GPIO va khong dieu khien tai that.");
-  Serial.println("Gia tri mac dinh: cam bien OK, khong co khan, nhiet do 25 C.");
-  Serial.print("Thoi gian mo phong: kiem tra gio ");
-  Serial.print(kAirflowSettleMs / 1000);
-  Serial.print(" s; xac nhan kho ");
-  Serial.print(kDryConfirmMs / 1000);
-  Serial.print(" s; gioi han chu ky ");
-  Serial.print(kSimulationMaxRunMs / 1000);
-  Serial.println(" s.");
-  printHelp();
+  pinMode(PIN_FAN, OUTPUT);
+  pinMode(PIN_PTC1, OUTPUT);
+  pinMode(PIN_PTC2, OUTPUT);
+  setFan(false);
+  setPTC(false);
+  pinMode(PIN_TOWEL, INPUT);
+
+  Wire.begin(21, 22);
+  shtOk = sht.begin(0x44);
+  ahtOk = aht.begin();
+  pinMode(PIN_ONEWIRE, INPUT_PULLUP);  // no external 4.7k available
+  ds.begin();
+  ds.setWaitForConversion(false);
+  Serial.printf("SHT31 %s, AHT20 %s, DS18B20 count %d\n",
+                shtOk ? "ok" : "FAIL", ahtOk ? "ok" : "FAIL", ds.getDeviceCount());
 }
 
 void loop() {
-  const unsigned long now = millis();
-  readSerialCommands(now);
-  if (now - lastLoopMs >= kLoopIntervalMs) {
-    lastLoopMs = now;
-    updateController(now);
+  if (millis() - lastTick < 1000) return;
+  lastTick = millis();
+
+  // --- read sensors ---
+  ds.requestTemperatures();
+  delay(200);
+  float tOut = ds.getTempCByIndex(0);
+  bool tempOk = (tOut > -100.0 && tOut < 125.0);
+
+  float hIn = shtOk ? sht.readHumidity() : NAN;
+  sensors_event_t hum, tmp;
+  float hRoom = NAN;
+  if (ahtOk) { aht.getEvent(&hum, &tmp); hRoom = hum.relative_humidity; }
+  bool humOk = !isnan(hIn) && !isnan(hRoom);
+
+  // towel presence (debounced)
+  bool raw = digitalRead(PIN_TOWEL) == (TOWEL_ACTIVE_LOW ? LOW : HIGH);
+  if (raw != towelPresent) {
+    if (++towelCount >= TOWEL_DEBOUNCE) { towelPresent = raw; towelCount = 0; }
+  } else towelCount = 0;
+
+  // --- state machine ---
+  uint32_t el = millis() - stateStart;
+  switch (state) {
+    case IDLE:
+      setFan(false); setPTC(false);
+      if (towelPresent) enter(RUN);
+      break;
+
+    case RUN:
+      setFan(true);
+      if (!tempOk || tOut >= T_HARD_CUT) setPTC(false);        // fail-safe
+      else if (tOut < T_HEAT_ON) setPTC(true);
+      else if (tOut > T_HEAT_OFF) setPTC(false);
+
+      if (!towelPresent) { setPTC(false); enter(COOL); break; }
+      if (el > MAX_RUN_MS) { setPTC(false); enter(COOL); break; }
+
+      if (humOk && el > MIN_RUN_MS) {
+        if (hIn <= hRoom + DRY_MARGIN) {
+          if (!dryStart) dryStart = millis();
+          if (millis() - dryStart > DRY_HOLD_MS) { setPTC(false); enter(COOL); }
+        } else dryStart = 0;
+      }
+      break;
+
+    case COOL:
+      setPTC(false); setFan(true);
+      if (el > COOL_MS) { setFan(false); enter(DONE); }
+      break;
+
+    case DONE:
+      setFan(false); setPTC(false);
+      if (!towelPresent) enter(IDLE);   // wait for towel removal before re-arming
+      break;
   }
-  if (now - lastStatusMs >= kStatusIntervalMs) {
-    lastStatusMs = now;
-    printStatus(now);
-  }
+
+  Serial.printf("st=%d towel=%d Tout=%.1f hIn=%.1f hRoom=%.1f fan=%d ptc=%d t=%lus\n",
+                state, towelPresent, tOut, hIn, hRoom, digitalRead(PIN_FAN), ptcOn, el / 1000);
 }
